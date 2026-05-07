@@ -1,0 +1,148 @@
+//@version=6
+strategy("LuxAlgo | Nifty 50 Master ORB (Clean Edition)", 
+     overlay = true, 
+     margin_long = 100, 
+     margin_short = 100, 
+     initial_capital = 100000, 
+     default_qty_type = strategy.percent_of_equity, 
+     default_qty_value = 100)
+
+// --- Inputs ---
+orbSession      = input.session("0915-0945", "Opening Range (IST)")
+rrRatio         = input.float(2.5, "Final Target RR Ratio", minval = 1.0, step = 0.1)
+retestThreshold = input.float(0.1, "Retest Buffer %", minval = 0.0, maxval = 1.0, step = 0.01) / 100
+useVwap         = input.bool(true, "VWAP Trend Filter")
+useAdx          = input.bool(true, "ADX Momentum Filter")
+
+// --- Risk Management ---
+moveBE          = input.bool(true, "Move SL to BE at 1:1 RR")
+dailyLossLimit  = input.float(1.5, "Daily Max Loss %")
+dailyProfitGoal = input.float(3.0, "Daily Profit Target %")
+
+// --- Indicators ---
+vwapVal  = ta.vwap(close)
+[diPlus, diMinus, adx] = ta.dmi(14, 14)
+volMa    = ta.sma(volume, 20)
+
+// --- Daily P&L ---
+var float startEquity = na
+if ta.change(time("D")) != 0
+    startEquity := strategy.equity
+
+dailyPnlPerc = not na(startEquity) and startEquity != 0 ? ((strategy.equity - startEquity) / startEquity) * 100 : 0
+canTradeToday = dailyPnlPerc > -dailyLossLimit and dailyPnlPerc < dailyProfitGoal
+
+// --- ORB ---
+var float orbH = na
+var float orbL = na
+var int   tradesToday = 0
+var float entryPrice  = na
+var float currentSl   = na
+var float currentTp   = na
+
+isNewDay = ta.change(time("D")) != 0
+inOrb    = not na(time(timeframe.period, orbSession, "GMT+530"))
+isEod    = not na(time(timeframe.period, "1515-1530", "GMT+530"))
+
+if isNewDay
+    orbH := na
+    orbL := na
+    tradesToday := 0
+    entryPrice  := na
+    currentSl   := na
+    currentTp   := na
+
+if inOrb
+    orbH := na(orbH) ? high : math.max(orbH, high)
+    orbL := na(orbL) ? low  : math.min(orbL, low)
+
+// --- Entry Conditions ---
+canEnter = not inOrb and not na(orbH) and tradesToday < 1 and strategy.position_size == 0 and canTradeToday
+
+momentumOk = not useAdx or adx > 20
+vwapLong   = not useVwap or close > vwapVal
+vwapShort  = not useVwap or close < vwapVal
+
+longCondition  = canEnter and momentumOk and close > orbH and volume > volMa and vwapLong and low <= orbH * (1 + retestThreshold)
+shortCondition = canEnter and momentumOk and close < orbL and volume > volMa and vwapShort and high >= orbL * (1 - retestThreshold)
+
+// --- Execution ---
+if longCondition
+    float sl   = low[1]
+    float risk = close - sl
+    if risk > 0
+        entryPrice  := close
+        currentSl   := sl
+        currentTp   := close + (risk * rrRatio)
+        strategy.entry("Long", strategy.long)
+        tradesToday += 1
+            
+else if shortCondition
+    float sl   = high[1]
+    float risk = sl - close
+    if risk > 0
+        entryPrice  := close
+        currentSl   := sl
+        currentTp   := close - (risk * rrRatio)
+        strategy.entry("Short", strategy.short)
+        tradesToday += 1
+
+// --- Trade Management ---
+if strategy.position_size != 0
+    float riskVal = math.abs(entryPrice - currentSl)
+    
+    if moveBE
+        if strategy.position_size > 0 and high >= entryPrice + riskVal
+            currentSl := math.max(currentSl, entryPrice)
+        else if strategy.position_size < 0 and low <= entryPrice - riskVal
+            currentSl := math.min(currentSl, entryPrice)
+            
+    strategy.exit("Exit", stop = currentSl, limit = currentTp)
+
+if (isEod or not canTradeToday) and strategy.position_size != 0
+    strategy.close_all()
+
+// --- Visuals ---
+plotH = plot(orbH, "ORB High", color = #089981, linewidth = 2, style = plot.style_linebr)
+plotL = plot(orbL, "ORB Low",  color = #f23645, linewidth = 2, style = plot.style_linebr)
+fill(plotH, plotL, color = inOrb ? color.new(#5b9cf6, 90) : na)
+
+plot(useVwap ? vwapVal : na, "VWAP", color = color.new(color.orange, 50))
+
+plot(strategy.position_size != 0 ? currentSl : na, color = color.new(color.red, 30), style = plot.style_linebr)
+plot(strategy.position_size != 0 ? currentTp : na, color = color.new(color.green, 30), style = plot.style_linebr)
+
+// --- CLEAN LABELS ---
+plotshape(longCondition, 
+     location=location.belowbar, 
+     color=#089981, 
+     style=shape.labelup, 
+     text="BUY", 
+     textcolor=color.white, 
+     size=size.small)
+
+plotshape(shortCondition, 
+     location=location.abovebar, 
+     color=#f23645, 
+     style=shape.labeldown, 
+     text="SELL", 
+     textcolor=color.white, 
+     size=size.small)
+
+closeCondition = strategy.position_size[1] != 0 and strategy.position_size == 0
+
+plotshape(closeCondition, 
+     location=location.abovebar, 
+     color=color.yellow, 
+     style=shape.labeldown, 
+     text="CLOSE", 
+     textcolor=color.black, 
+     size=size.small)
+
+// --- Dashboard ---
+var table dash = table.new(position.top_right, 2, 2, bgcolor = color.new(color.black, 70))
+if barstate.islast
+    table.cell(dash, 0, 0, "Daily PnL:", text_color = color.white)
+    table.cell(dash, 1, 0, str.format("{0,number,#.##}%", dailyPnlPerc), text_color = dailyPnlPerc >= 0 ? #089981 : #f23645)
+    table.cell(dash, 0, 1, "Status:", text_color = color.white)
+    table.cell(dash, 1, 1, canTradeToday ? "Active" : "Stopped", text_color = canTradeToday ? #089981 : #f23645)
